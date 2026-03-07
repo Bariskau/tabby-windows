@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.tabby-windows" path="/org/gnome/shell/extensions/tabby-windows/">
+
+    <key name="tabby-toggle-group" type="as">
+      <default>['&lt;Super&gt;t']</default>
+      <summary>Toggle tab group</summary>
+      <description>Group all windows of the focused app as tabs, or ungroup if already grouped</description>
+    </key>
+
+    <key name="tabby-next-tab" type="as">
+      <default>['&lt;Control&gt;&lt;Super&gt;Right']</default>
+      <summary>Next tab</summary>
+      <description>Switch to next tab in the group</description>
+    </key>
+
+    <key name="tabby-prev-tab" type="as">
+      <default>['&lt;Control&gt;&lt;Super&gt;Left']</default>
+      <summary>Previous tab</summary>
+      <description>Switch to previous tab in the group</description>
+    </key>
+
+    <key name="tabby-close-tab" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;t']</default>
+      <summary>Remove tab from group</summary>
+      <description>Remove current window from tab group</description>
+    </key>
+
+  </schema>
+</schemalist>

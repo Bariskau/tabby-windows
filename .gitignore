@@ -1,0 +1,6 @@
+schemas/gschemas.compiled
+*.swp
+*.swo
+*~
+.claude/
+.idea/
