@@ -14,17 +14,9 @@ const DRAG_THRESHOLD = 8;
 const BAR_POLL_MS = 200;
 const TITLE_BUDGET = 50;
 
-const ACCENT_MAP = {
-    blue:   {r: 53,  g: 132, b: 228},
-    teal:   {r: 33,  g: 144, b: 164},
-    green:  {r: 58,  g: 148, b: 74},
-    yellow: {r: 200, g: 136, b: 0},
-    orange: {r: 237, g: 91,  b: 0},
-    red:    {r: 230, g: 45,  b: 66},
-    pink:   {r: 213, g: 97,  b: 153},
-    purple: {r: 145, g: 65,  b: 172},
-    slate:  {r: 111, g: 131, b: 150},
-};
+// Fallback accent
+const FALLBACK_ACCENT = 'background-gradient-direction: horizontal; background-gradient-start: rgba(119,41,83,0.92); background-gradient-end: rgba(233,84,32,0.92);';
+const FALLBACK_ACCENT_DIM = 'background-gradient-direction: horizontal; background-gradient-start: rgba(119,41,83,0.5); background-gradient-end: rgba(233,84,32,0.5);';
 
 function rgba(r, g, b, a) {
     return `rgba(${r},${g},${b},${a})`;
@@ -39,20 +31,22 @@ function readThemeColors() {
         barBg:    rgba(24, 24, 24, 0.97),
         tabBg:    rgba(255, 255, 255, 0.06),
         tabHover: rgba(255, 255, 255, 0.12),
-        accent:   rgba(53, 132, 228, 0.92),
-        dragBg:   rgba(53, 132, 228, 0.5),
+        accent:   FALLBACK_ACCENT,
+        dragBg:   FALLBACK_ACCENT_DIM,
         fgDim:    rgba(255, 255, 255, 0.55),
         fgActive: rgba(255, 255, 255, 1.0),
     };
 
     try {
         Main.panel.ensure_style();
-        const bg = Main.panel.get_theme_node().get_background_color();
+        const node = Main.panel.get_theme_node();
+        const bg = node.get_background_color();
         if (bg.alpha > 0) {
             c.barBg = rgba(bg.red, bg.green, bg.blue, 0.97);
             c.tabBg = rgba(clamp255(bg.red + 20), clamp255(bg.green + 20), clamp255(bg.blue + 20), 0.35);
             c.tabHover = rgba(clamp255(bg.red + 40), clamp255(bg.green + 40), clamp255(bg.blue + 40), 0.5);
         }
+
     } catch (_) {}
 
     try {
@@ -64,16 +58,6 @@ function readThemeColors() {
                 c.fgDim = rgba(fg.red, fg.green, fg.blue, 0.55);
                 c.fgActive = rgba(fg.red, fg.green, fg.blue, 1.0);
             }
-        }
-    } catch (_) {}
-
-    try {
-        const name = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'})
-            .get_string('accent-color');
-        const ac = ACCENT_MAP[name];
-        if (ac) {
-            c.accent = rgba(ac.r, ac.g, ac.b, 0.92);
-            c.dragBg = rgba(ac.r, ac.g, ac.b, 0.5);
         }
     } catch (_) {}
 
@@ -211,6 +195,7 @@ class TabGroup {
             height: BAR_HEIGHT,
             width: rect.width,
         });
+        this._bar.get_layout_manager().homogeneous = true;
 
         const tracker = Shell.WindowTracker.get_default();
         const maxLen = Math.max(12, Math.floor(TITLE_BUDGET / this._windows.length));
@@ -221,7 +206,7 @@ class TabGroup {
             const title = this._windows[i].get_title() || app?.get_name() || 'Window';
             const label = title.length > maxLen ? title.substring(0, maxLen - 1) + '…' : title;
 
-            const btnStyle = `background-color: ${isActive ? tc.accent : tc.tabBg};`;
+            const btnStyle = isActive ? tc.accent : `background-color: ${tc.tabBg};`;
             const btn = new St.Button({
                 style_class: 'tabby-tab-btn',
                 style: btnStyle,
@@ -268,22 +253,23 @@ class TabGroup {
                     : `color: ${tc.fgDim};`,
             }));
 
-            // Close button
+            // Close button (system icon)
+            const closeIcon = new St.Icon({
+                icon_name: 'window-close-symbolic',
+                icon_size: 12,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
             const closeBtn = new St.Button({
                 style_class: 'tabby-close-btn',
-                style: `color: ${isActive ? tc.fgActive : tc.fgDim};`,
+                style: `opacity: ${isActive ? 180 : 120};`,
                 reactive: true,
                 track_hover: true,
-                child: new St.Label({
-                    text: '×',
-                    y_align: Clutter.ActorAlign.CENTER,
-                    style: 'font-size: 14px; font-weight: bold;',
-                }),
+                child: closeIcon,
             });
             closeBtn.connect('notify::hover', () => {
                 closeBtn.set_style(closeBtn.hover
-                    ? 'color: #ff5555; font-size: 14px;'
-                    : `color: ${isActive ? tc.fgActive : tc.fgDim};`);
+                    ? 'opacity: 255; background-color: rgba(255,70,70,0.6); border-radius: 4px;'
+                    : `opacity: ${isActive ? 180 : 120};`);
                 if (closeBtn.hover)
                     global.display.set_cursor(Meta.Cursor.POINTING_HAND);
             });
@@ -291,9 +277,7 @@ class TabGroup {
             closeBtn.connect('clicked', () => {
                 const w = this._windows[closeIdx];
                 if (!w) return;
-                this._ext._winMap.delete(w);
-                this.removeWindow(w);
-                w.unminimize();
+                w.delete(global.get_current_time());
             });
             content.add_child(closeBtn);
 
@@ -320,12 +304,13 @@ class TabGroup {
         btn.connect('button-press-event', (_a, ev) => {
             if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
             this._drag = {
-                index: idx,
+                sourceIndex: idx,
                 startX: ev.get_coords()[0],
                 dragging: false,
                 actor: btn,
                 origStyle,
                 dragBg,
+                hoverIndex: -1,
             };
             return Clutter.EVENT_PROPAGATE;
         });
@@ -347,43 +332,56 @@ class TabGroup {
 
             if (!this._drag.dragging && Math.abs(x - this._drag.startX) > DRAG_THRESHOLD) {
                 this._drag.dragging = true;
-                this._drag.actor.set_style(`background-color: ${this._drag.dragBg}; opacity: 180;`);
+                this._drag.actor.set_style(`${this._drag.dragBg} opacity: 180;`);
+                global.display.set_cursor(Meta.Cursor.DND_IN_DRAG);
             }
 
             if (this._drag.dragging) {
                 const children = this._bar.get_children();
+                let newHover = -1;
                 for (let j = 0; j < children.length; j++) {
-                    if (j === this._drag.index) continue;
+                    if (j === this._drag.sourceIndex) continue;
                     const cx = children[j].get_transformed_position()[0];
                     const cw = children[j].get_width();
                     if (x > cx && x < cx + cw) {
-                        this._swapTabs(this._drag.index, j);
-                        this._drag.index = j;
+                        newHover = j;
                         break;
                     }
+                }
+                // Highlight drop target
+                if (newHover !== this._drag.hoverIndex) {
+                    if (this._drag.hoverIndex >= 0 && this._drag.hoverIndex < children.length)
+                        children[this._drag.hoverIndex].set_style(this._drag.origStyle);
+                    if (newHover >= 0)
+                        children[newHover].set_style('background-color: rgba(255,255,255,0.2); border-style: dashed;');
+                    this._drag.hoverIndex = newHover;
                 }
             }
             return Clutter.EVENT_STOP;
         });
     }
 
-    _swapTabs(from, to) {
-        [this._windows[from], this._windows[to]] = [this._windows[to], this._windows[from]];
+    _moveTab(from, to) {
+        const win = this._windows.splice(from, 1)[0];
+        this._windows.splice(to, 0, win);
 
-        if (this._activeIndex === from) this._activeIndex = to;
-        else if (this._activeIndex === to) this._activeIndex = from;
-
-        const children = this._bar.get_children();
-        const child = children[from];
-        this._bar.remove_child(child);
-        const ref = this._bar.get_children()[to];
-        if (ref) this._bar.insert_child_below(child, ref);
-        else this._bar.add_child(child);
+        // Update active index to follow the active window
+        if (this._activeIndex === from) {
+            this._activeIndex = to;
+        } else if (from < this._activeIndex && to >= this._activeIndex) {
+            this._activeIndex--;
+        } else if (from > this._activeIndex && to <= this._activeIndex) {
+            this._activeIndex++;
+        }
     }
 
     _endDrag() {
         if (this._drag) {
+            const from = this._drag.sourceIndex;
+            const to = this._drag.hoverIndex;
             this._drag.actor.set_style(this._drag.origStyle);
+            if (to >= 0 && to !== from)
+                this._moveTab(from, to);
             this._drag = null;
         }
         global.display.set_cursor(Meta.Cursor.DEFAULT);

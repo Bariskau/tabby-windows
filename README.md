@@ -5,6 +5,8 @@ GNOME Shell extension that lets you group windows of the same application as **b
 ![GNOME 46/47](https://img.shields.io/badge/GNOME-46%20%7C%2047-blue)
 ![License](https://img.shields.io/badge/license-GPL--3.0-green)
 
+![Tabby Windows UI](.files/ui.png)
+
 ## Features
 
 - **Tab grouping** — Group all windows of the focused app into a single tab bar
