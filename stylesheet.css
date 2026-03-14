@@ -1,24 +1,31 @@
 .tabby-bar {
-    border-radius: 12px 12px 0 0;
-    padding: 4px 5px 3px 5px;
-    spacing: 3px;
+    border-radius: 0 0 0 0;
+    padding: 0 6px 0 6px;
+    spacing: 4px;
+    transition-duration: 120ms;
+    transition-property: background-color, width, height, opacity;
 }
 
 .tabby-tab-btn {
-    border-radius: 8px;
-    padding: 3px 14px;
+    border-radius: 8px 8px 0 0;
+    padding: 2px 12px;
+    border: 1px solid transparent;
+    transition-duration: 120ms;
+    transition-property: background-color, border-color, border-width, box-shadow;
 }
 
 .tabby-tab-content {
-    spacing: 7px;
+    spacing: 8px;
 }
 
 .tabby-tab-label {
-    font-size: 11.5px;
+    font-size: 11px;
     font-weight: 400;
 }
 
 .tabby-close-btn {
-    padding: 0 2px 0 4px;
-    border-radius: 4px;
+    padding: 3px;
+    border-radius: 99px;
+    transition-duration: 100ms;
+    transition-property: background-color, opacity;
 }

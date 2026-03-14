@@ -3,20 +3,18 @@ import Shell from 'gi://Shell';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
-import Gio from 'gi://Gio';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const BAR_HEIGHT = 36;
-const BAR_GAP = 1;
+const BAR_HEIGHT = 28;
 const ICON_SIZE = 18;
 const DRAG_THRESHOLD = 8;
-const BAR_POLL_MS = 200;
 const TITLE_BUDGET = 50;
+const POSITION_EASE_MS = 60;
 
-// Fallback accent
-const FALLBACK_ACCENT = 'background-gradient-direction: horizontal; background-gradient-start: rgba(119,41,83,0.92); background-gradient-end: rgba(233,84,32,0.92);';
-const FALLBACK_ACCENT_DIM = 'background-gradient-direction: horizontal; background-gradient-start: rgba(119,41,83,0.5); background-gradient-end: rgba(233,84,32,0.5);';
+// Fallback accent (light gray)
+const FALLBACK_ACCENT = 'background-color: rgba(255,255,255,0.18);';
+const FALLBACK_ACCENT_DIM = 'background-color: rgba(255,255,255,0.10);';
 
 function rgba(r, g, b, a) {
     return `rgba(${r},${g},${b},${a})`;
@@ -45,8 +43,9 @@ function readThemeColors() {
             c.barBg = rgba(bg.red, bg.green, bg.blue, 0.97);
             c.tabBg = rgba(clamp255(bg.red + 20), clamp255(bg.green + 20), clamp255(bg.blue + 20), 0.35);
             c.tabHover = rgba(clamp255(bg.red + 40), clamp255(bg.green + 40), clamp255(bg.blue + 40), 0.5);
+            c.accent = `background-color: ${rgba(clamp255(bg.red + 50), clamp255(bg.green + 50), clamp255(bg.blue + 50), 0.7)};`;
+            c.dragBg = `background-color: ${rgba(clamp255(bg.red + 50), clamp255(bg.green + 50), clamp255(bg.blue + 50), 0.4)};`;
         }
-
     } catch (_) {}
 
     try {
@@ -74,6 +73,21 @@ function frameOf(win) {
     return {x: r.x, y: r.y, width: r.width, height: r.height};
 }
 
+function workAreaOf(win) {
+    return global.workspace_manager
+        .get_active_workspace()
+        .get_work_area_for_monitor(win.get_monitor());
+}
+
+function getBarRect(win) {
+    const wa = workAreaOf(win);
+    return {
+        x: wa.x,
+        y: wa.y,
+        width: wa.width,
+    };
+}
+
 
 class TabGroup {
     constructor(id, ext) {
@@ -83,9 +97,12 @@ class TabGroup {
         this._activeIndex = 0;
         this._bar = null;
         this._signals = new Map();
-        this._timerId = null;
+        this._positionSignals = [];
+        this._trackedWindow = null;
         this._frame = null;
         this._drag = null;
+        this._barRect = null;
+        this._titleSignals = [];
     }
 
     get windows() { return this._windows; }
@@ -108,6 +125,7 @@ class TabGroup {
         if (sid) { try { win.disconnect(sid); } catch (_) {} }
         this._signals.delete(win);
         this._windows.splice(idx, 1);
+        this._ext._forgetWindow(win);
 
         if (this._windows.length === 0) {
             this.destroy();
@@ -126,22 +144,63 @@ class TabGroup {
     }
 
     activateByIndex(i) {
-        if (i >= 0 && i < this._windows.length) {
-            this._activeIndex = i;
-            this.sync();
-        }
+        if (i >= 0 && i < this._windows.length)
+            this._switchTab(i);
     }
 
     activateNext() {
         if (this._windows.length <= 1) return;
-        this._activeIndex = (this._activeIndex + 1) % this._windows.length;
-        this.sync();
+        this._switchTab((this._activeIndex + 1) % this._windows.length);
     }
 
     activatePrev() {
         if (this._windows.length <= 1) return;
-        this._activeIndex = (this._activeIndex - 1 + this._windows.length) % this._windows.length;
-        this.sync();
+        this._switchTab((this._activeIndex - 1 + this._windows.length) % this._windows.length);
+    }
+
+    _switchTab(newIndex) {
+        if (newIndex === this._activeIndex) return;
+        const prevIndex = this._activeIndex;
+        this._activeIndex = newIndex;
+        this._syncWindows();
+
+        if (!this._bar || !this._tc) {
+            this._rebuildBar();
+            return;
+        }
+
+        const children = this._bar.get_children();
+        if (prevIndex >= children.length || newIndex >= children.length) {
+            this._rebuildBar();
+            return;
+        }
+
+        this._applyTabStyle(children[prevIndex], false);
+        this._applyTabStyle(children[newIndex], true);
+        this._watchPosition();
+    }
+
+    _applyTabStyle(btn, isActive) {
+        const tc = this._tc;
+        const style = isActive ? tc.accent : `background-color: ${tc.tabBg};`;
+        btn.set_style(style);
+        btn._tabbyBaseStyle = style;
+        btn._tabbyIsActive = isActive;
+
+        const content = btn.get_child();
+        if (!content) return;
+        for (const child of content.get_children()) {
+            if (child.style_class === 'tabby-tab-label') {
+                child.set_style(isActive
+                    ? `color: ${tc.fgActive}; font-weight: 600;`
+                    : `color: ${tc.fgDim};`);
+            } else if (child.style_class === 'tabby-close-btn') {
+                if (!child.hover)
+                    child.set_style(`opacity: ${isActive ? 180 : 120};`);
+            } else if (child.icon_size === ICON_SIZE) {
+                child.set_opacity(isActive ? 255 : 160);
+            }
+        }
     }
 
     // --- Window management ---
@@ -162,8 +221,18 @@ class TabGroup {
         for (let i = 0; i < this._windows.length; i++) {
             const w = this._windows[i];
             if (i === this._activeIndex) {
-                if (this._frame)
-                    w.move_resize_frame(false, this._frame.x, this._frame.y, this._frame.width, this._frame.height);
+                if (w.is_fullscreen())
+                    w.unmake_fullscreen();
+                if (w.get_maximized())
+                    w.unmaximize(Meta.MaximizeFlags.BOTH);
+                if (this._frame) {
+                    const wa = workAreaOf(w);
+                    const minY = wa.y + BAR_HEIGHT;
+                    const y = Math.max(this._frame.y, minY);
+                    const maxH = wa.y + wa.height - y;
+                    const h = Math.min(this._frame.height, maxH);
+                    w.move_resize_frame(false, wa.x, y, wa.width, h);
+                }
                 skipEffect(w);
                 w.unminimize();
                 w.activate(time);
@@ -176,26 +245,29 @@ class TabGroup {
 
     // --- Tab bar ---
 
-    _rebuildBar() {
+    _rebuildBar(animate = true) {
         this._destroyBar();
         if (this._windows.length < 2) return;
 
         const active = this.activeWindow;
         if (!active) return;
 
-        const rect = active.get_frame_rect();
+        const rect = getBarRect(active);
         const tc = readThemeColors();
+        this._tc = tc;
 
         this._bar = new St.BoxLayout({
             style_class: 'tabby-bar',
             style: `background-color: ${tc.barBg};`,
             reactive: true,
             x: rect.x,
-            y: Math.max(0, rect.y - BAR_HEIGHT - BAR_GAP),
+            y: rect.y,
             height: BAR_HEIGHT,
             width: rect.width,
         });
+        this._barRect = rect;
         this._bar.get_layout_manager().homogeneous = true;
+        if (animate) this._bar.opacity = 0;
 
         const tracker = Shell.WindowTracker.get_default();
         const maxLen = Math.max(12, Math.floor(TITLE_BUDGET / this._windows.length));
@@ -214,17 +286,22 @@ class TabGroup {
                 track_hover: true,
                 x_expand: true,
             });
+            btn._tabbyBaseStyle = btnStyle;
+            btn._tabbyIsActive = isActive;
+            btn._tabbyWin = this._windows[i];
 
             // Hover: cursor + color
             btn.connect('notify::hover', () => {
+                if (this._drag?.dragging)
+                    return;
                 if (btn.hover) {
                     global.display.set_cursor(Meta.Cursor.POINTING_HAND);
-                    if (!isActive && !this._drag?.dragging)
+                    if (!btn._tabbyIsActive)
                         btn.set_style(`background-color: ${tc.tabHover};`);
                 } else {
                     global.display.set_cursor(Meta.Cursor.DEFAULT);
-                    if (!isActive && !this._drag?.dragging)
-                        btn.set_style(`background-color: ${tc.tabBg};`);
+                    if (!btn._tabbyIsActive)
+                        btn.set_style(btn._tabbyBaseStyle);
                 }
             });
 
@@ -244,14 +321,23 @@ class TabGroup {
                 } catch (_) {}
             }
 
-            content.add_child(new St.Label({
+            const labelWidget = new St.Label({
                 text: label,
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'tabby-tab-label',
                 style: isActive
                     ? `color: ${tc.fgActive}; font-weight: 600;`
                     : `color: ${tc.fgDim};`,
-            }));
+            });
+            content.add_child(labelWidget);
+
+            // Track title changes
+            const winRef = this._windows[i];
+            const titleSigId = winRef.connect('notify::title', () => {
+                const t = winRef.get_title() || app?.get_name() || 'Window';
+                labelWidget.set_text(t.length > maxLen ? t.substring(0, maxLen - 1) + '…' : t);
+            });
+            this._titleSignals.push({win: winRef, id: titleSigId});
 
             // Close button (system icon)
             const closeIcon = new St.Icon({
@@ -267,22 +353,24 @@ class TabGroup {
                 child: closeIcon,
             });
             closeBtn.connect('notify::hover', () => {
+                if (this._drag?.dragging)
+                    return;
                 closeBtn.set_style(closeBtn.hover
-                    ? 'opacity: 255; background-color: rgba(255,70,70,0.6); border-radius: 4px;'
-                    : `opacity: ${isActive ? 180 : 120};`);
+                    ? 'opacity: 255; background-color: rgba(255,70,70,0.6); border-radius: 99px;'
+                    : `opacity: ${btn._tabbyIsActive ? 180 : 120};`);
                 if (closeBtn.hover)
                     global.display.set_cursor(Meta.Cursor.POINTING_HAND);
+                else
+                    global.display.set_cursor(Meta.Cursor.DEFAULT);
             });
-            const closeIdx = i;
             closeBtn.connect('clicked', () => {
-                const w = this._windows[closeIdx];
-                if (!w) return;
-                w.delete(global.get_current_time());
+                if (!btn._tabbyWin) return;
+                btn._tabbyWin.delete(global.get_current_time());
             });
             content.add_child(closeBtn);
 
             btn.set_child(content);
-            this._connectDrag(btn, i, btnStyle, tc.dragBg);
+            this._connectDrag(btn, btnStyle, tc.dragBg);
             this._bar.add_child(btn);
         }
 
@@ -294,24 +382,44 @@ class TabGroup {
             return Clutter.EVENT_PROPAGATE;
         });
 
-        Main.layoutManager.uiGroup.add_child(this._bar);
+        Main.layoutManager.addChrome(this._bar, {trackFullscreen: false});
+        if (animate) {
+            this._bar.ease({
+                opacity: 255,
+                duration: 140,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+        }
         this._watchPosition();
     }
 
     // --- Drag-to-reorder ---
 
-    _connectDrag(btn, idx, origStyle, dragBg) {
+    _connectDrag(btn, origStyle, dragBg) {
         btn.connect('button-press-event', (_a, ev) => {
             if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
+            const idx = this._windows.indexOf(btn._tabbyWin);
+            if (idx === -1) return Clutter.EVENT_PROPAGATE;
+            const children = this._bar.get_children();
+            const positions = children.map(c => c.get_transformed_position()[0]);
+            const tabWidth = children[0].get_width();
+            const spacing = children.length > 1
+                ? positions[1] - positions[0]
+                : tabWidth;
+
             this._drag = {
                 sourceIndex: idx,
+                insertIndex: idx,
                 startX: ev.get_coords()[0],
                 dragging: false,
                 actor: btn,
                 origStyle,
                 dragBg,
-                hoverIndex: -1,
+                positions,
+                tabWidth,
+                spacing,
             };
+            global.display.set_cursor(Meta.Cursor.POINTING_HAND);
             return Clutter.EVENT_PROPAGATE;
         });
 
@@ -321,7 +429,8 @@ class TabGroup {
                 this._endDrag();
             } else {
                 this._drag = null;
-                this.activateByIndex(idx);
+                const idx = this._windows.indexOf(btn._tabbyWin);
+                if (idx !== -1) this.activateByIndex(idx);
             }
             return Clutter.EVENT_STOP;
         });
@@ -329,32 +438,55 @@ class TabGroup {
         btn.connect('motion-event', (_a, ev) => {
             if (!this._drag) return Clutter.EVENT_PROPAGATE;
             const [x] = ev.get_coords();
+            const dx = x - this._drag.startX;
 
-            if (!this._drag.dragging && Math.abs(x - this._drag.startX) > DRAG_THRESHOLD) {
+            if (!this._drag.dragging && Math.abs(dx) > DRAG_THRESHOLD) {
                 this._drag.dragging = true;
-                this._drag.actor.set_style(`${this._drag.dragBg} opacity: 180;`);
+                this._drag.actor.set_style(`${this._drag.dragBg} opacity: 220;`);
+                this._drag.actor.set_z_position(1);
                 global.display.set_cursor(Meta.Cursor.DND_IN_DRAG);
+                // Catch release outside bar
+                this._drag._stageId = global.stage.connect('captured-event', (_s, event) => {
+                    if (event.type() === Clutter.EventType.BUTTON_RELEASE) {
+                        this._endDrag();
+                        return Clutter.EVENT_STOP;
+                    }
+                    return Clutter.EVENT_PROPAGATE;
+                });
             }
 
-            if (this._drag.dragging) {
+            if (!this._drag.dragging) return Clutter.EVENT_PROPAGATE;
+
+            // Dragged tab follows cursor
+            this._drag.actor.translation_x = dx;
+
+            // Compute insertion slot from cursor position
+            const src = this._drag.sourceIndex;
+            const tw = this._drag.tabWidth;
+            const sp = this._drag.spacing;
+            const firstPos = this._drag.positions[0];
+            const draggedCenter = this._drag.positions[src] + tw / 2 + dx;
+            let slot = Math.round((draggedCenter - firstPos - tw / 2) / sp);
+            slot = Math.max(0, Math.min(this._windows.length - 1, slot));
+
+            // Slide other tabs to make room
+            if (slot !== this._drag.insertIndex) {
+                this._drag.insertIndex = slot;
                 const children = this._bar.get_children();
-                let newHover = -1;
                 for (let j = 0; j < children.length; j++) {
-                    if (j === this._drag.sourceIndex) continue;
-                    const cx = children[j].get_transformed_position()[0];
-                    const cw = children[j].get_width();
-                    if (x > cx && x < cx + cw) {
-                        newHover = j;
-                        break;
-                    }
-                }
-                // Highlight drop target
-                if (newHover !== this._drag.hoverIndex) {
-                    if (this._drag.hoverIndex >= 0 && this._drag.hoverIndex < children.length)
-                        children[this._drag.hoverIndex].set_style(this._drag.origStyle);
-                    if (newHover >= 0)
-                        children[newHover].set_style('background-color: rgba(255,255,255,0.2); border-style: dashed;');
-                    this._drag.hoverIndex = newHover;
+                    if (j === src) continue;
+                    let shift = 0;
+                    if (src < slot && j > src && j <= slot)
+                        shift = -sp;
+                    else if (src > slot && j < src && j >= slot)
+                        shift = sp;
+
+                    children[j].remove_all_transitions();
+                    children[j].ease({
+                        translation_x: shift,
+                        duration: 200,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    });
                 }
             }
             return Clutter.EVENT_STOP;
@@ -377,51 +509,105 @@ class TabGroup {
 
     _endDrag() {
         if (this._drag) {
+            if (this._drag._stageId) {
+                global.stage.disconnect(this._drag._stageId);
+            }
             const from = this._drag.sourceIndex;
-            const to = this._drag.hoverIndex;
-            this._drag.actor.set_style(this._drag.origStyle);
-            if (to >= 0 && to !== from)
-                this._moveTab(from, to);
+            const to = this._drag.insertIndex;
+
+            // Reset all translations
+            const children = this._bar.get_children();
+            for (const child of children) {
+                child.remove_all_transitions();
+                child.translation_x = 0;
+                child.set_z_position(0);
+            }
+
             this._drag = null;
+
+            if (to !== from) {
+                this._moveTab(from, to);
+                // Reorder bar child to match window order
+                const child = children[from];
+                this._bar.remove_child(child);
+                this._bar.insert_child_at_index(child, to);
+            }
         }
         global.display.set_cursor(Meta.Cursor.DEFAULT);
-        this._rebuildBar();
     }
 
     // --- Position tracking ---
 
     _watchPosition() {
-        this._clearTimer();
-        this._timerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, BAR_POLL_MS, () => {
-            const win = this.activeWindow;
-            if (!this._bar || !win) {
-                this._timerId = null;
-                return GLib.SOURCE_REMOVE;
-            }
-            try {
-                const r = win.get_frame_rect();
-                this._bar.set_position(r.x, Math.max(0, r.y - BAR_HEIGHT - BAR_GAP));
-                this._bar.set_width(r.width);
-            } catch (_) {
-                this._timerId = null;
-                return GLib.SOURCE_REMOVE;
-            }
-            return GLib.SOURCE_CONTINUE;
-        });
+        this._clearPositionWatch();
+
+        const win = this.activeWindow;
+        if (!this._bar || !win)
+            return;
+
+        this._trackedWindow = win;
+        this._positionSignals.push(win.connect('position-changed', () => this._syncBarPosition(true)));
+        this._positionSignals.push(win.connect('workspace-changed', () => this._syncBarPosition(false)));
+
+        this._syncBarPosition(false);
     }
 
-    _clearTimer() {
-        if (this._timerId) {
-            GLib.source_remove(this._timerId);
-            this._timerId = null;
+    _syncBarPosition(animate) {
+        if (!this._bar || !this._trackedWindow)
+            return;
+
+        try {
+            const r = getBarRect(this._trackedWindow);
+            if (this._barRect &&
+                this._barRect.x === r.x &&
+                this._barRect.y === r.y &&
+                this._barRect.width === r.width)
+                return;
+
+            this._barRect = r;
+            this._bar.remove_all_transitions();
+
+            if (animate) {
+                this._bar.ease({
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    duration: POSITION_EASE_MS,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                });
+            } else {
+                this._bar.set_position(r.x, r.y);
+                this._bar.set_width(r.width);
+            }
+        } catch (_) {
+            this._clearPositionWatch();
         }
+    }
+
+    _clearPositionWatch() {
+        if (this._trackedWindow) {
+            for (const sid of this._positionSignals) {
+                try { this._trackedWindow.disconnect(sid); } catch (_) {}
+            }
+        }
+        this._positionSignals = [];
+        this._trackedWindow = null;
     }
 
     _destroyBar() {
         global.display.set_cursor(Meta.Cursor.DEFAULT);
-        this._clearTimer();
+        this._clearPositionWatch();
+        if (this._drag?._stageId) {
+            global.stage.disconnect(this._drag._stageId);
+        }
         this._drag = null;
+        this._barRect = null;
+        for (const {win, id} of this._titleSignals) {
+            try { win.disconnect(id); } catch (_) {}
+        }
+        this._titleSignals = [];
         if (this._bar) {
+            Main.layoutManager.removeChrome(this._bar);
             this._bar.destroy();
             this._bar = null;
         }
@@ -543,7 +729,6 @@ export default class TabbyExtension extends Extension {
         const group = this._winMap.get(win);
         if (!group) return;
         group.removeWindow(win);
-        this._winMap.delete(win);
         win.unminimize();
     }
 
@@ -558,13 +743,17 @@ export default class TabbyExtension extends Extension {
         // Find an existing group for this app
         for (const group of this._groups) {
             const groupApp = tracker.get_window_app(group.windows[0]);
-            if (groupApp === app) {
+            if (groupApp === app && group.windows[0]?.get_workspace() === win.get_workspace()) {
                 group.addWindow(win);
                 this._winMap.set(win, group);
                 group.sync();
                 return;
             }
         }
+    }
+
+    _forgetWindow(win) {
+        this._winMap.delete(win);
     }
 
     _removeGroup(group) {
