@@ -375,12 +375,13 @@ class TabGroup {
         }
 
         this._bar.connect('button-release-event', () => {
-            if (this._drag?.dragging) {
+            if (this._drag) {
                 this._endDrag();
                 return Clutter.EVENT_STOP;
             }
             return Clutter.EVENT_PROPAGATE;
         });
+
 
         Main.layoutManager.addChrome(this._bar, {trackFullscreen: false});
         if (animate) {
@@ -396,39 +397,21 @@ class TabGroup {
     // --- Drag-to-reorder ---
 
     _connectDrag(btn, origStyle, dragBg) {
+        // pressX is local per button — only tracks pre-drag press position.
+        // this._drag is only created when threshold is actually exceeded.
+        let pressX = null;
+
         btn.connect('button-press-event', (_a, ev) => {
             if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
-            const idx = this._windows.indexOf(btn._tabbyWin);
-            if (idx === -1) return Clutter.EVENT_PROPAGATE;
-            const children = this._bar.get_children();
-            const positions = children.map(c => c.get_transformed_position()[0]);
-            const tabWidth = children[0].get_width();
-            const spacing = children.length > 1
-                ? positions[1] - positions[0]
-                : tabWidth;
-
-            this._drag = {
-                sourceIndex: idx,
-                insertIndex: idx,
-                startX: ev.get_coords()[0],
-                dragging: false,
-                actor: btn,
-                origStyle,
-                dragBg,
-                positions,
-                tabWidth,
-                spacing,
-            };
-            global.display.set_cursor(Meta.Cursor.POINTING_HAND);
+            pressX = ev.get_coords()[0];
             return Clutter.EVENT_PROPAGATE;
         });
 
         btn.connect('button-release-event', () => {
-            if (!this._drag) return Clutter.EVENT_PROPAGATE;
-            if (this._drag.dragging) {
+            pressX = null;
+            if (this._drag) {
                 this._endDrag();
             } else {
-                this._drag = null;
                 const idx = this._windows.indexOf(btn._tabbyWin);
                 if (idx !== -1) this.activateByIndex(idx);
             }
@@ -436,31 +419,63 @@ class TabGroup {
         });
 
         btn.connect('motion-event', (_a, ev) => {
-            if (!this._drag) return Clutter.EVENT_PROPAGATE;
-            const [x] = ev.get_coords();
-            const dx = x - this._drag.startX;
+            // Safety: if mouse button not held, clean up any stale state
+            if (!(ev.get_state() & Clutter.ModifierType.BUTTON1_MASK)) {
+                pressX = null;
+                if (this._drag) this._endDrag();
+                return Clutter.EVENT_PROPAGATE;
+            }
 
-            if (!this._drag.dragging && Math.abs(dx) > DRAG_THRESHOLD) {
-                this._drag.dragging = true;
-                this._drag.actor.set_style(`${this._drag.dragBg} opacity: 220;`);
-                this._drag.actor.set_z_position(1);
+            // Pre-drag: detect threshold
+            if (pressX !== null && !this._drag) {
+                const [x] = ev.get_coords();
+                if (Math.abs(x - pressX) <= DRAG_THRESHOLD)
+                    return Clutter.EVENT_PROPAGATE;
+
+                const idx = this._windows.indexOf(btn._tabbyWin);
+                if (idx === -1) { pressX = null; return Clutter.EVENT_PROPAGATE; }
+
+                const children = this._bar.get_children();
+                const positions = children.map(c => c.get_transformed_position()[0]);
+                const tabWidth = children[0].get_width();
+                const spacing = children.length > 1 ? positions[1] - positions[0] : tabWidth;
+
+                this._drag = {
+                    sourceIndex: idx,
+                    insertIndex: idx,
+                    startX: pressX,
+                    actor: btn,
+                    origStyle,
+                    dragBg,
+                    positions,
+                    tabWidth,
+                    spacing,
+                };
+                pressX = null;
+
+                btn.set_style(`${dragBg} opacity: 220;`);
+                btn.set_z_position(1);
                 global.display.set_cursor(Meta.Cursor.DND_IN_DRAG);
-                // Catch release outside bar
+
+                // Stage handler: end drag if cursor leaves bar vertically
                 this._drag._stageId = global.stage.connect('captured-event', (_s, event) => {
-                    if (event.type() === Clutter.EventType.BUTTON_RELEASE) {
+                    if (event.type() !== Clutter.EventType.MOTION || !this._bar)
+                        return Clutter.EVENT_PROPAGATE;
+                    const [, y] = event.get_coords();
+                    const [, barY] = this._bar.get_transformed_position();
+                    if (y < barY || y > barY + this._bar.get_height())
                         this._endDrag();
-                        return Clutter.EVENT_STOP;
-                    }
                     return Clutter.EVENT_PROPAGATE;
                 });
             }
 
-            if (!this._drag.dragging) return Clutter.EVENT_PROPAGATE;
+            if (!this._drag) return Clutter.EVENT_PROPAGATE;
 
-            // Dragged tab follows cursor
+            // Active drag: move tab
+            const [x] = ev.get_coords();
+            const dx = x - this._drag.startX;
             this._drag.actor.translation_x = dx;
 
-            // Compute insertion slot from cursor position
             const src = this._drag.sourceIndex;
             const tw = this._drag.tabWidth;
             const sp = this._drag.spacing;
@@ -469,17 +484,14 @@ class TabGroup {
             let slot = Math.round((draggedCenter - firstPos - tw / 2) / sp);
             slot = Math.max(0, Math.min(this._windows.length - 1, slot));
 
-            // Slide other tabs to make room
             if (slot !== this._drag.insertIndex) {
                 this._drag.insertIndex = slot;
                 const children = this._bar.get_children();
                 for (let j = 0; j < children.length; j++) {
                     if (j === src) continue;
                     let shift = 0;
-                    if (src < slot && j > src && j <= slot)
-                        shift = -sp;
-                    else if (src > slot && j < src && j >= slot)
-                        shift = sp;
+                    if (src < slot && j > src && j <= slot) shift = -sp;
+                    else if (src > slot && j < src && j >= slot) shift = sp;
 
                     children[j].remove_all_transitions();
                     children[j].ease({
@@ -508,31 +520,34 @@ class TabGroup {
     }
 
     _endDrag() {
-        if (this._drag) {
-            if (this._drag._stageId) {
-                global.stage.disconnect(this._drag._stageId);
-            }
-            const from = this._drag.sourceIndex;
-            const to = this._drag.insertIndex;
+        if (!this._drag) return;
 
-            // Reset all translations
-            const children = this._bar.get_children();
-            for (const child of children) {
-                child.remove_all_transitions();
-                child.translation_x = 0;
-                child.set_z_position(0);
-            }
-
-            this._drag = null;
-
-            if (to !== from) {
-                this._moveTab(from, to);
-                // Reorder bar child to match window order
-                const child = children[from];
-                this._bar.remove_child(child);
-                this._bar.insert_child_at_index(child, to);
-            }
+        if (this._drag._stageId) {
+            global.stage.disconnect(this._drag._stageId);
         }
+
+        // Restore dragged tab's original style
+        this._drag.actor.set_style(this._drag.origStyle);
+
+        const from = this._drag.sourceIndex;
+        const to = this._drag.insertIndex;
+
+        const children = this._bar.get_children();
+        for (const child of children) {
+            child.remove_all_transitions();
+            child.translation_x = 0;
+            child.set_z_position(0);
+        }
+
+        this._drag = null;
+
+        if (to !== from) {
+            this._moveTab(from, to);
+            const child = children[from];
+            this._bar.remove_child(child);
+            this._bar.insert_child_at_index(child, to);
+        }
+
         global.display.set_cursor(Meta.Cursor.DEFAULT);
     }
 
